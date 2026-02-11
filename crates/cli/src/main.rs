@@ -10,8 +10,8 @@ use dytopo_analyze::{
 use dytopo_core::AgentId;
 use dytopo_embed::{Embedder, HashEmbedder, OllamaEmbedder};
 use dytopo_llm::{LlmClient, OllamaHost, OllamaPool};
-use dytopo_orchestrator::{run_stub, OrchestratorConfig};
-use dytopo_router::{BaselineTopology, RouterConfig};
+use dytopo_orchestrator::{run_stub, OrchestratorConfig, TopologyMode};
+use dytopo_router::RouterConfig;
 use dytopo_viz::write_dot;
 use std::sync::Arc;
 
@@ -37,6 +37,32 @@ enum EmbedderType {
     Hash,
     /// Ollama embeddings (semantic, using nomic-embed-text or similar)
     Ollama,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum, PartialEq)]
+enum TopologyType {
+    /// Dynamic routing based on semantic similarity
+    Dynamic,
+    /// Fully connected - all agents connected to all others
+    FullyConnected,
+    /// Star topology - agent 1 is hub connected to all
+    Star,
+    /// Chain topology - sequential 1->2->3->...
+    Chain,
+    /// Ring topology - circular 1->2->3->...->1
+    Ring,
+}
+
+impl TopologyType {
+    fn to_mode(self) -> TopologyMode {
+        match self {
+            TopologyType::Dynamic => TopologyMode::Dynamic,
+            TopologyType::FullyConnected => TopologyMode::FullyConnected,
+            TopologyType::Star => TopologyMode::Star,
+            TopologyType::Chain => TopologyMode::Chain,
+            TopologyType::Ring => TopologyMode::Ring,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -122,6 +148,10 @@ enum Command {
         /// Ollama URL for embeddings (defaults to first LLM host)
         #[arg(long)]
         embed_url: Option<String>,
+
+        /// Topology mode (dynamic = semantic routing, or fixed baseline)
+        #[arg(long, value_enum, default_value_t = TopologyType::Dynamic)]
+        topology: TopologyType,
     },
 
     /// Compare dynamic routing against baseline topologies
@@ -275,6 +305,7 @@ fn main() -> Result<()> {
             embedder,
             embed_model,
             embed_url,
+            topology,
         } => {
             // Create embedder based on type
             let embedder_impl: Box<dyn Embedder> = match embedder {
@@ -293,6 +324,9 @@ fn main() -> Result<()> {
                 }
             };
 
+            let topo_mode = topology.to_mode();
+            println!("Topology mode: {:?}", topo_mode);
+
             let cfg = OrchestratorConfig {
                 rounds,
                 max_inbox,
@@ -301,6 +335,7 @@ fn main() -> Result<()> {
                     min_score,
                     force_connect,
                 },
+                topology_mode: topo_mode,
             };
 
             // Create agents based on LLM provider
@@ -378,7 +413,6 @@ fn main() -> Result<()> {
             no_eval,
         } => {
             use dytopo_llm::OllamaClient;
-            use dytopo_router::build_baseline_topology;
             use std::time::Instant;
 
             std::fs::create_dir_all(&out)?;
@@ -393,8 +427,6 @@ fn main() -> Result<()> {
             }
             println!();
 
-            let agent_ids: Vec<AgentId> = (1..=agents).map(AgentId).collect();
-
             // Create embedder for dynamic routing
             let embedder = OllamaEmbedder::new(&embed_url, &embed_model)?;
 
@@ -408,99 +440,122 @@ fn main() -> Result<()> {
                 ))
             };
 
-            // Run dynamic routing experiment
-            println!("Running DYNAMIC routing experiment...");
-            let dynamic_start = Instant::now();
+            // Define all topology modes to test
+            let topology_modes = [
+                TopologyMode::Dynamic,
+                TopologyMode::FullyConnected,
+                TopologyMode::Star,
+                TopologyMode::Chain,
+                TopologyMode::Ring,
+            ];
 
-            let cfg = OrchestratorConfig {
-                rounds,
-                max_inbox: 3,
-                router: RouterConfig {
-                    topk_per_receiver: 2,
-                    min_score: 0.1,
-                    force_connect: true,
-                },
+            // Run experiments for each topology
+            let mut results: Vec<(TopologyMode, dytopo_analyze::TraceMetrics, Option<QualityEval>)> = Vec::new();
+
+            for topo_mode in &topology_modes {
+                println!("Running {} topology...", topo_mode.name().to_uppercase());
+                let start = Instant::now();
+
+                let cfg = OrchestratorConfig {
+                    rounds,
+                    max_inbox: 3,
+                    router: RouterConfig {
+                        topk_per_receiver: 2,
+                        min_score: 0.1,
+                        force_connect: true,
+                    },
+                    topology_mode: *topo_mode,
+                };
+
+                let workers: Vec<Box<dyn Agent>> = (0..agents)
+                    .map(|i| {
+                        let id = AgentId(i + 1);
+                        Box::new(StubWorker::new(id, 1234)) as Box<dyn Agent>
+                    })
+                    .collect();
+
+                let run = run_stub(&task, workers, &embedder, &cfg, &out, topo_mode.name())?;
+                let duration = start.elapsed();
+
+                // Load and analyze trace
+                let trace = load_trace(&run.trace_path)?;
+                let metrics = compute_metrics(&trace, &run.trace_path);
+
+                println!("  Duration: {:?}", duration);
+                println!("  Edges/Round: {:.1}", metrics.summary.avg_edges_per_round);
+
+                // Evaluate quality if judge is available
+                let quality: Option<QualityEval> = if let Some(ref judge_llm) = judge {
+                    if let Some(solution) = extract_solution(&trace) {
+                        let tokens = compute_total_tokens(&trace);
+                        print!("  Evaluating quality... ");
+                        match evaluate_quality(&task, &solution, tokens, judge_llm) {
+                            Ok(eval) => {
+                                println!("{:.1}/10", eval.score);
+                                Some(eval)
+                            }
+                            Err(e) => {
+                                println!("failed: {e}");
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                results.push((*topo_mode, metrics, quality));
+                println!();
+            }
+
+            // Print comparison summary
+            println!("=== Results Summary ===\n");
+            println!("| Topology | Duration | Edges/Round | Avg Score | Quality |");
+            println!("|----------|----------|-------------|-----------|---------|");
+
+            for (mode, metrics, quality) in &results {
+                let quality_str = quality
+                    .as_ref()
+                    .map(|q| format!("{:.1}/10", q.score))
+                    .unwrap_or_else(|| "N/A".to_string());
+                println!(
+                    "| {} | {}ms | {:.1} | {:.3} | {} |",
+                    mode.name(),
+                    metrics.summary.total_duration_ms,
+                    metrics.summary.avg_edges_per_round,
+                    metrics.summary.overall_avg_score,
+                    quality_str
+                );
+            }
+
+            // Find dynamic results for baseline comparison
+            let dynamic_result = results
+                .iter()
+                .find(|(m, _, _)| *m == TopologyMode::Dynamic);
+
+            // Generate plots from dynamic metrics (or first available)
+            let primary_metrics = dynamic_result
+                .map(|(_, m, _)| m)
+                .or_else(|| results.first().map(|(_, m, _)| m));
+
+            let mut plot_paths = if let Some(metrics) = primary_metrics {
+                generate_all_plots(metrics, &out)?
+            } else {
+                Vec::new()
             };
 
-            let workers: Vec<Box<dyn Agent>> = (0..agents)
-                .map(|i| {
-                    let id = AgentId(i + 1);
-                    Box::new(StubWorker::new(id, 1234)) as Box<dyn Agent>
+            // Generate quality comparison plot if we have evaluations
+            let quality_data: Vec<(&str, f32)> = results
+                .iter()
+                .filter_map(|(mode, _, quality)| {
+                    quality.as_ref().map(|q| (mode.name(), q.score))
                 })
                 .collect();
 
-            let dynamic_run = run_stub(&task, workers, &embedder, &cfg, &out, "dynamic")?;
-            let dynamic_duration = dynamic_start.elapsed();
-
-            // Compute metrics for dynamic
-            let dynamic_trace = load_trace(&dynamic_run.trace_path)?;
-            let dynamic_metrics = compute_metrics(&dynamic_trace, &dynamic_run.trace_path);
-
-            println!("  Duration: {:?}", dynamic_duration);
-            println!("  Avg Score: {:.3}", dynamic_metrics.summary.overall_avg_score);
-            println!("  Edge Stability: {:.1}%", dynamic_metrics.summary.edge_stability * 100.0);
-
-            // Extract solution and evaluate quality
-            let dynamic_quality: Option<QualityEval> = if let Some(ref judge_llm) = judge {
-                if let Some(solution) = extract_solution(&dynamic_trace) {
-                    let tokens = compute_total_tokens(&dynamic_trace);
-                    println!("  Evaluating solution quality...");
-                    match evaluate_quality(&task, &solution, tokens, judge_llm) {
-                        Ok(eval) => {
-                            println!("  Quality Score: {:.1}/10", eval.score);
-                            println!("    Correctness: {:.1}, Completeness: {:.1}, Clarity: {:.1}",
-                                eval.correctness, eval.completeness, eval.clarity);
-                            Some(eval)
-                        }
-                        Err(e) => {
-                            println!("  Quality evaluation failed: {e}");
-                            None
-                        }
-                    }
-                } else {
-                    println!("  No solution to evaluate (empty trace)");
-                    None
-                }
-            } else {
-                None
-            };
-
-            println!();
-
-            // Run baseline experiments (just compute topology metrics, no full orchestration)
-            let baselines = [
-                ("FullyConnected", BaselineTopology::FullyConnected),
-                ("Star", BaselineTopology::Star),
-                ("Chain", BaselineTopology::Chain),
-                ("Ring", BaselineTopology::Ring),
-            ];
-
-            println!("Baseline Topologies (edge counts for comparison):\n");
-            println!("| Topology | Edges | Density |");
-            println!("|----------|-------|---------|");
-
-            for (name, baseline) in &baselines {
-                let topo = build_baseline_topology(0, *baseline, &agent_ids);
-                let max_edges = agents * (agents - 1);
-                let density = topo.edges.len() as f32 / max_edges as f32;
-                println!("| {} | {} | {:.1}% |", name, topo.edges.len(), density * 100.0);
-            }
-
-            println!();
-            println!("Dynamic Routing Summary:");
-            println!("  Total Duration: {}ms", dynamic_metrics.summary.total_duration_ms);
-            println!("  Avg Edges/Round: {:.1}", dynamic_metrics.summary.avg_edges_per_round);
-            println!("  Avg Score: {:.3}", dynamic_metrics.summary.overall_avg_score);
-            println!("  Score Trend: {:+.4}/round", dynamic_metrics.summary.score_trend);
-            println!("  Edge Stability: {:.1}%", dynamic_metrics.summary.edge_stability * 100.0);
-
-            // Generate comparison plots
-            let mut plot_paths = generate_all_plots(&dynamic_metrics, &out)?;
-
-            // Generate quality plot if we have evaluation
-            if let Some(ref eval) = dynamic_quality {
-                let quality_data = vec![("Dynamic", eval.score)];
-                let quality_plot_path = format!("{}/quality.svg", out);
+            if !quality_data.is_empty() {
+                let quality_plot_path = format!("{}/quality_comparison.svg", out);
                 if plot_quality_comparison(&quality_data, &quality_plot_path).is_ok() {
                     plot_paths.push(quality_plot_path);
                 }
@@ -511,85 +566,114 @@ fn main() -> Result<()> {
                 println!("  {p}");
             }
 
-            // Write comparison report
+            // Write comprehensive comparison report
             let report_path = format!("{}/benchmark_report.md", out);
             let mut report = String::new();
             report.push_str("# DyTopo Benchmark Report\n\n");
             report.push_str(&format!("**Task:** {}\n\n", task));
             report.push_str(&format!("**Agents:** {} | **Rounds:** {}\n\n", agents, rounds));
 
-            // Quality evaluation section
-            if let Some(ref eval) = dynamic_quality {
-                report.push_str("## Solution Quality (LLM-as-Judge)\n\n");
-                report.push_str("| Criterion | Score (1-10) |\n");
-                report.push_str("|-----------|-------------|\n");
-                report.push_str(&format!("| **Overall** | **{:.1}** |\n", eval.score));
-                report.push_str(&format!("| Correctness | {:.1} |\n", eval.correctness));
-                report.push_str(&format!("| Completeness | {:.1} |\n", eval.completeness));
-                report.push_str(&format!("| Clarity | {:.1} |\n", eval.clarity));
-                report.push_str(&format!("\n**Reasoning:** {}\n\n", eval.reasoning));
-            }
+            // All topologies comparison table
+            report.push_str("## Topology Comparison\n\n");
+            report.push_str("| Topology | Duration (ms) | Edges/Round | Avg Score | Stability | Quality |\n");
+            report.push_str("|----------|---------------|-------------|-----------|-----------|--------|\n");
 
-            report.push_str("## Dynamic Routing Results\n\n");
-            report.push_str("| Metric | Value |\n|--------|-------|\n");
-            report.push_str(&format!("| Total Duration | {}ms |\n", dynamic_metrics.summary.total_duration_ms));
-            report.push_str(&format!("| Avg Edges/Round | {:.1} |\n", dynamic_metrics.summary.avg_edges_per_round));
-            report.push_str(&format!("| Avg Score | {:.3} |\n", dynamic_metrics.summary.overall_avg_score));
-            report.push_str(&format!("| Score Trend | {:+.4}/round |\n", dynamic_metrics.summary.score_trend));
-            report.push_str(&format!("| Edge Stability | {:.1}% |\n", dynamic_metrics.summary.edge_stability * 100.0));
-
-            report.push_str("\n## Baseline Comparison\n\n");
-            report.push_str("| Topology | Edges | Density | vs Dynamic |\n");
-            report.push_str("|----------|-------|---------|------------|\n");
-
-            let dynamic_edges = dynamic_metrics.summary.avg_edges_per_round;
-            for (name, baseline) in &baselines {
-                let topo = build_baseline_topology(0, *baseline, &agent_ids);
-                let max_edges = agents * (agents - 1);
-                let density = topo.edges.len() as f32 / max_edges as f32;
-                let ratio = topo.edges.len() as f32 / dynamic_edges;
+            for (mode, metrics, quality) in &results {
+                let quality_str = quality
+                    .as_ref()
+                    .map(|q| format!("{:.1}/10", q.score))
+                    .unwrap_or_else(|| "N/A".to_string());
                 report.push_str(&format!(
-                    "| {} | {} | {:.1}% | {:.1}x |\n",
-                    name, topo.edges.len(), density * 100.0, ratio
+                    "| {} | {} | {:.1} | {:.3} | {:.1}% | {} |\n",
+                    mode.name(),
+                    metrics.summary.total_duration_ms,
+                    metrics.summary.avg_edges_per_round,
+                    metrics.summary.overall_avg_score,
+                    metrics.summary.edge_stability * 100.0,
+                    quality_str
                 ));
             }
 
-            report.push_str("\n## Key Insight\n\n");
-            if let Some(ref eval) = dynamic_quality {
+            // Quality evaluation details
+            let has_quality = results.iter().any(|(_, _, q)| q.is_some());
+            if has_quality {
+                report.push_str("\n## Quality Evaluation Details (LLM-as-Judge)\n\n");
+                report.push_str("| Topology | Overall | Correctness | Completeness | Clarity |\n");
+                report.push_str("|----------|---------|-------------|--------------|--------|\n");
+
+                for (mode, _, quality) in &results {
+                    if let Some(eval) = quality {
+                        report.push_str(&format!(
+                            "| {} | **{:.1}** | {:.1} | {:.1} | {:.1} |\n",
+                            mode.name(),
+                            eval.score,
+                            eval.correctness,
+                            eval.completeness,
+                            eval.clarity
+                        ));
+                    }
+                }
+            }
+
+            // Edge efficiency comparison
+            report.push_str("\n## Edge Efficiency\n\n");
+            let max_edges = agents * (agents - 1);
+            report.push_str(&format!("Maximum possible edges: {} (fully connected)\n\n", max_edges));
+            report.push_str("| Topology | Edges/Round | Efficiency |\n");
+            report.push_str("|----------|-------------|------------|\n");
+
+            for (mode, metrics, _) in &results {
+                let efficiency = (max_edges as f32 - metrics.summary.avg_edges_per_round) / max_edges as f32 * 100.0;
                 report.push_str(&format!(
-                    "Dynamic routing achieved a **quality score of {:.1}/10** while using ",
-                    eval.score
+                    "| {} | {:.1} | {:.1}% reduction |\n",
+                    mode.name(),
+                    metrics.summary.avg_edges_per_round,
+                    efficiency.max(0.0)
                 ));
+            }
+
+            // Key insight
+            report.push_str("\n## Key Insights\n\n");
+
+            if let Some((_, dynamic_metrics, dynamic_quality)) = dynamic_result {
+                let fc_result = results.iter().find(|(m, _, _)| *m == TopologyMode::FullyConnected);
+
+                if let Some((_, fc_metrics, fc_quality)) = fc_result {
+                    let edge_ratio = dynamic_metrics.summary.avg_edges_per_round / fc_metrics.summary.avg_edges_per_round;
+                    report.push_str(&format!(
+                        "- **Dynamic routing uses {:.1}% of fully-connected edges** ({:.1} vs {:.1})\n",
+                        edge_ratio * 100.0,
+                        dynamic_metrics.summary.avg_edges_per_round,
+                        fc_metrics.summary.avg_edges_per_round
+                    ));
+
+                    if let (Some(dq), Some(fq)) = (dynamic_quality, fc_quality) {
+                        let quality_diff = dq.score - fq.score;
+                        if quality_diff >= 0.0 {
+                            report.push_str(&format!(
+                                "- **Quality maintained or improved**: Dynamic {:.1}/10 vs Fully-Connected {:.1}/10 ({:+.1})\n",
+                                dq.score, fq.score, quality_diff
+                            ));
+                        } else {
+                            report.push_str(&format!(
+                                "- **Quality trade-off**: Dynamic {:.1}/10 vs Fully-Connected {:.1}/10 ({:.1})\n",
+                                dq.score, fq.score, quality_diff
+                            ));
+                        }
+                    }
+                }
+
                 report.push_str(&format!(
-                    "only **{:.0}% of the edges** that a fully-connected topology would use. ",
-                    (dynamic_edges / (agents * (agents - 1)) as f32) * 100.0
-                ));
-                report.push_str("This demonstrates that semantic matching can achieve good results ");
-                report.push_str("with significantly fewer connections.\n\n");
-            } else {
-                report.push_str("Dynamic routing achieves **semantic matching** between agents, ");
-                report.push_str("connecting those with complementary needs/offers. ");
-                report.push_str(&format!(
-                    "With an average score of {:.3}, agents are matched based on semantic similarity ",
+                    "- **Semantic routing score**: {:.3} average similarity\n",
                     dynamic_metrics.summary.overall_avg_score
                 ));
-                report.push_str("rather than arbitrary topology.\n\n");
+                report.push_str(&format!(
+                    "- **Routing stability**: {:.1}% edge retention between rounds\n",
+                    dynamic_metrics.summary.edge_stability * 100.0
+                ));
             }
 
-            // Solution excerpt
-            if let Some(solution) = extract_solution(&dynamic_trace) {
-                report.push_str("## Solution Excerpt\n\n");
-                report.push_str("```\n");
-                // Truncate to first 1000 chars
-                let excerpt: String = solution.chars().take(1000).collect();
-                report.push_str(&excerpt);
-                if solution.len() > 1000 {
-                    report.push_str("\n... (truncated)");
-                }
-                report.push_str("\n```\n\n");
-            }
-
-            report.push_str("## Plots\n\n");
+            report.push_str("\n## Plots\n\n");
             for p in &plot_paths {
                 let filename = std::path::Path::new(p).file_name().unwrap().to_str().unwrap();
                 report.push_str(&format!("![{}]({})\n\n", filename, filename));

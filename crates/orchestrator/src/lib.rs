@@ -2,15 +2,53 @@ use anyhow::Result;
 use dytopo_agents::{Agent, Manager};
 use dytopo_core::{AgentId, Message, Topology, TraceEvent};
 use dytopo_embed::Embedder;
-use dytopo_router::{build_topology, RouterConfig};
+use dytopo_router::{build_baseline_topology, build_topology, BaselineTopology, RouterConfig};
 use std::fs::{create_dir_all, File};
 use std::io::{BufWriter, Write};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Topology routing mode.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum TopologyMode {
+    /// Dynamic routing based on semantic similarity
+    Dynamic,
+    /// Fixed fully-connected topology
+    FullyConnected,
+    /// Fixed star topology (agent 1 is hub)
+    Star,
+    /// Fixed chain topology (1->2->3->...)
+    Chain,
+    /// Fixed ring topology (1->2->3->...->1)
+    Ring,
+}
+
+impl TopologyMode {
+    pub fn name(&self) -> &'static str {
+        match self {
+            TopologyMode::Dynamic => "dynamic",
+            TopologyMode::FullyConnected => "fully_connected",
+            TopologyMode::Star => "star",
+            TopologyMode::Chain => "chain",
+            TopologyMode::Ring => "ring",
+        }
+    }
+
+    pub fn to_baseline(&self) -> Option<BaselineTopology> {
+        match self {
+            TopologyMode::Dynamic => None,
+            TopologyMode::FullyConnected => Some(BaselineTopology::FullyConnected),
+            TopologyMode::Star => Some(BaselineTopology::Star),
+            TopologyMode::Chain => Some(BaselineTopology::Chain),
+            TopologyMode::Ring => Some(BaselineTopology::Ring),
+        }
+    }
+}
 
 pub struct OrchestratorConfig {
     pub rounds: usize,
     pub router: RouterConfig,
     pub max_inbox: usize,
+    pub topology_mode: TopologyMode,
 }
 
 impl Default for OrchestratorConfig {
@@ -19,6 +57,7 @@ impl Default for OrchestratorConfig {
             rounds: 3,
             router: RouterConfig::default(),
             max_inbox: 3,
+            topology_mode: TopologyMode::Dynamic,
         }
     }
 }
@@ -92,7 +131,14 @@ pub fn run_stub(
         let keys: Vec<(AgentId, String)> = ios.iter().map(|io| (io.agent_id, io.key.clone())).collect();
         let queries: Vec<(AgentId, String)> = ios.iter().map(|io| (io.agent_id, io.query.clone())).collect();
 
-        let topo = build_topology(round, embedder, &keys, &queries, &cfg.router)?;
+        // Build topology based on mode
+        let topo = match cfg.topology_mode.to_baseline() {
+            Some(baseline) => {
+                let agent_ids: Vec<AgentId> = ios.iter().map(|io| io.agent_id).collect();
+                build_baseline_topology(round, baseline, &agent_ids)
+            }
+            None => build_topology(round, embedder, &keys, &queries, &cfg.router)?,
+        };
         let topo_ev = TraceEvent::Topology {
             round,
             edges: topo.edges.clone(),
