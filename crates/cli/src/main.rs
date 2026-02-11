@@ -3,7 +3,10 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
 use dytopo_agents::{specialties, Agent, LlmWorker, LlmWorkerConfig, StubWorker};
-use dytopo_analyze::{compute_metrics, format_report, generate_all_plots, load_trace};
+use dytopo_analyze::{
+    compute_metrics, compute_total_tokens, evaluate_quality, extract_solution,
+    format_report, generate_all_plots, load_trace, plot_quality_comparison, QualityEval,
+};
 use dytopo_core::AgentId;
 use dytopo_embed::{Embedder, HashEmbedder, OllamaEmbedder};
 use dytopo_llm::{LlmClient, OllamaHost, OllamaPool};
@@ -139,13 +142,21 @@ enum Command {
         #[arg(long, default_value = "benchmark")]
         out: String,
 
-        /// Ollama URL for embeddings
+        /// Ollama URL for embeddings and LLM judge
         #[arg(long, default_value = "http://localhost:11434")]
         embed_url: String,
 
         /// Embedding model
         #[arg(long, default_value = "nomic-embed-text")]
         embed_model: String,
+
+        /// LLM model for judge (to evaluate quality)
+        #[arg(long, default_value = "qwen2.5:7b-instruct")]
+        judge_model: String,
+
+        /// Skip LLM quality evaluation (faster, metrics only)
+        #[arg(long)]
+        no_eval: bool,
     },
 }
 
@@ -363,7 +374,10 @@ fn main() -> Result<()> {
             out,
             embed_url,
             embed_model,
+            judge_model,
+            no_eval,
         } => {
+            use dytopo_llm::OllamaClient;
             use dytopo_router::build_baseline_topology;
             use std::time::Instant;
 
@@ -374,12 +388,25 @@ fn main() -> Result<()> {
             println!("Agents: {agents}");
             println!("Rounds: {rounds}");
             println!("Embeddings: {embed_url} ({embed_model})");
+            if !no_eval {
+                println!("Judge Model: {judge_model}");
+            }
             println!();
 
             let agent_ids: Vec<AgentId> = (1..=agents).map(AgentId).collect();
 
             // Create embedder for dynamic routing
             let embedder = OllamaEmbedder::new(&embed_url, &embed_model)?;
+
+            // Create judge LLM for quality evaluation
+            let judge: Option<OllamaClient> = if no_eval {
+                None
+            } else {
+                Some(OllamaClient::new(
+                    OllamaHost::new("judge", &embed_url, 1),
+                    &judge_model,
+                ))
+            };
 
             // Run dynamic routing experiment
             println!("Running DYNAMIC routing experiment...");
@@ -412,6 +439,32 @@ fn main() -> Result<()> {
             println!("  Duration: {:?}", dynamic_duration);
             println!("  Avg Score: {:.3}", dynamic_metrics.summary.overall_avg_score);
             println!("  Edge Stability: {:.1}%", dynamic_metrics.summary.edge_stability * 100.0);
+
+            // Extract solution and evaluate quality
+            let dynamic_quality: Option<QualityEval> = if let Some(ref judge_llm) = judge {
+                if let Some(solution) = extract_solution(&dynamic_trace) {
+                    let tokens = compute_total_tokens(&dynamic_trace);
+                    println!("  Evaluating solution quality...");
+                    match evaluate_quality(&task, &solution, tokens, judge_llm) {
+                        Ok(eval) => {
+                            println!("  Quality Score: {:.1}/10", eval.score);
+                            println!("    Correctness: {:.1}, Completeness: {:.1}, Clarity: {:.1}",
+                                eval.correctness, eval.completeness, eval.clarity);
+                            Some(eval)
+                        }
+                        Err(e) => {
+                            println!("  Quality evaluation failed: {e}");
+                            None
+                        }
+                    }
+                } else {
+                    println!("  No solution to evaluate (empty trace)");
+                    None
+                }
+            } else {
+                None
+            };
+
             println!();
 
             // Run baseline experiments (just compute topology metrics, no full orchestration)
@@ -442,7 +495,17 @@ fn main() -> Result<()> {
             println!("  Edge Stability: {:.1}%", dynamic_metrics.summary.edge_stability * 100.0);
 
             // Generate comparison plots
-            let plot_paths = generate_all_plots(&dynamic_metrics, &out)?;
+            let mut plot_paths = generate_all_plots(&dynamic_metrics, &out)?;
+
+            // Generate quality plot if we have evaluation
+            if let Some(ref eval) = dynamic_quality {
+                let quality_data = vec![("Dynamic", eval.score)];
+                let quality_plot_path = format!("{}/quality.svg", out);
+                if plot_quality_comparison(&quality_data, &quality_plot_path).is_ok() {
+                    plot_paths.push(quality_plot_path);
+                }
+            }
+
             println!("\nGenerated plots:");
             for p in &plot_paths {
                 println!("  {p}");
@@ -454,6 +517,18 @@ fn main() -> Result<()> {
             report.push_str("# DyTopo Benchmark Report\n\n");
             report.push_str(&format!("**Task:** {}\n\n", task));
             report.push_str(&format!("**Agents:** {} | **Rounds:** {}\n\n", agents, rounds));
+
+            // Quality evaluation section
+            if let Some(ref eval) = dynamic_quality {
+                report.push_str("## Solution Quality (LLM-as-Judge)\n\n");
+                report.push_str("| Criterion | Score (1-10) |\n");
+                report.push_str("|-----------|-------------|\n");
+                report.push_str(&format!("| **Overall** | **{:.1}** |\n", eval.score));
+                report.push_str(&format!("| Correctness | {:.1} |\n", eval.correctness));
+                report.push_str(&format!("| Completeness | {:.1} |\n", eval.completeness));
+                report.push_str(&format!("| Clarity | {:.1} |\n", eval.clarity));
+                report.push_str(&format!("\n**Reasoning:** {}\n\n", eval.reasoning));
+            }
 
             report.push_str("## Dynamic Routing Results\n\n");
             report.push_str("| Metric | Value |\n|--------|-------|\n");
@@ -480,13 +555,39 @@ fn main() -> Result<()> {
             }
 
             report.push_str("\n## Key Insight\n\n");
-            report.push_str("Dynamic routing achieves **semantic matching** between agents, ");
-            report.push_str("connecting those with complementary needs/offers. ");
-            report.push_str(&format!(
-                "With an average score of {:.3}, agents are matched based on semantic similarity ",
-                dynamic_metrics.summary.overall_avg_score
-            ));
-            report.push_str("rather than arbitrary topology.\n\n");
+            if let Some(ref eval) = dynamic_quality {
+                report.push_str(&format!(
+                    "Dynamic routing achieved a **quality score of {:.1}/10** while using ",
+                    eval.score
+                ));
+                report.push_str(&format!(
+                    "only **{:.0}% of the edges** that a fully-connected topology would use. ",
+                    (dynamic_edges / (agents * (agents - 1)) as f32) * 100.0
+                ));
+                report.push_str("This demonstrates that semantic matching can achieve good results ");
+                report.push_str("with significantly fewer connections.\n\n");
+            } else {
+                report.push_str("Dynamic routing achieves **semantic matching** between agents, ");
+                report.push_str("connecting those with complementary needs/offers. ");
+                report.push_str(&format!(
+                    "With an average score of {:.3}, agents are matched based on semantic similarity ",
+                    dynamic_metrics.summary.overall_avg_score
+                ));
+                report.push_str("rather than arbitrary topology.\n\n");
+            }
+
+            // Solution excerpt
+            if let Some(solution) = extract_solution(&dynamic_trace) {
+                report.push_str("## Solution Excerpt\n\n");
+                report.push_str("```\n");
+                // Truncate to first 1000 chars
+                let excerpt: String = solution.chars().take(1000).collect();
+                report.push_str(&excerpt);
+                if solution.len() > 1000 {
+                    report.push_str("\n... (truncated)");
+                }
+                report.push_str("\n```\n\n");
+            }
 
             report.push_str("## Plots\n\n");
             for p in &plot_paths {

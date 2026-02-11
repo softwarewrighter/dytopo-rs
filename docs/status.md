@@ -74,7 +74,10 @@
 - [x] `analyze` command with metrics and plots
 - [x] `benchmark` command for comparative runs
 - [x] Comparison report generation
-- [x] SVG plot generation (scores, timing, density)
+- [x] SVG plot generation (scores, timing, density, quality)
+- [x] **LLM-as-judge quality scoring (1-10 scale)**
+- [x] **Solution extraction from final round**
+- [x] **Token tracking infrastructure**
 
 ---
 
@@ -205,6 +208,14 @@ With semantic embeddings:
 ---
 
 ## Change Log
+
+### 2026-02-11 (Late Evening)
+- **Outcome Quality Metrics Added:**
+  - LLM-as-judge quality scoring (correctness, completeness, clarity)
+  - Solution extraction from final round drafts
+  - Token tracking infrastructure (LlmResponse with tokens_in/tokens_out)
+  - Quality comparison plots
+  - `--judge-model` and `--no-eval` flags for benchmark command
 
 ### 2026-02-11 (Evening)
 - **Milestone 4 Complete:**

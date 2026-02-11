@@ -51,6 +51,10 @@ pub enum TraceEvent {
         query: String,
         key: String,
         draft: String,
+        #[serde(default)]
+        tokens_in: usize,
+        #[serde(default)]
+        tokens_out: usize,
     },
     Topology {
         round: usize,
@@ -66,5 +70,13 @@ pub enum TraceEvent {
     RoundEnd {
         round: usize,
         ts_unix_ms: u64,
+    },
+    /// Quality evaluation of the final solution
+    QualityEval {
+        task: String,
+        solution: String,
+        score: f32,
+        reasoning: String,
+        tokens_total: usize,
     },
 }

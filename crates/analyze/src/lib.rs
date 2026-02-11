@@ -31,6 +31,8 @@ pub struct AgentData {
     pub query: String,
     pub key: String,
     pub draft: String,
+    pub tokens_in: usize,
+    pub tokens_out: usize,
 }
 
 /// Load and parse a JSONL trace file.
@@ -72,6 +74,8 @@ pub fn load_trace(path: &str) -> Result<ParsedTrace> {
                 query,
                 key,
                 draft,
+                tokens_in,
+                tokens_out,
                 ..
             } => {
                 if let Some(ref mut rd) = current_round {
@@ -80,6 +84,8 @@ pub fn load_trace(path: &str) -> Result<ParsedTrace> {
                         query,
                         key,
                         draft,
+                        tokens_in,
+                        tokens_out,
                     });
                 }
             }
@@ -95,6 +101,9 @@ pub fn load_trace(path: &str) -> Result<ParsedTrace> {
             }
             TraceEvent::Message { .. } => {
                 // Messages are derivable from edges + agents
+            }
+            TraceEvent::QualityEval { .. } => {
+                // Quality evals are stored separately
             }
         }
     }
@@ -544,6 +553,243 @@ pub fn generate_all_plots(metrics: &TraceMetrics, output_dir: &str) -> Result<Ve
     Ok(paths)
 }
 
+// ============================================================================
+// Quality Evaluation
+// ============================================================================
+
+/// Quality evaluation result from LLM-as-judge.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QualityEval {
+    pub task: String,
+    pub solution: String,
+    pub score: f32,           // 1-10 scale
+    pub correctness: f32,     // 1-10 subscale
+    pub completeness: f32,    // 1-10 subscale
+    pub clarity: f32,         // 1-10 subscale
+    pub reasoning: String,
+    pub tokens_total: usize,
+}
+
+/// Extract the combined solution from the final round's agent drafts.
+pub fn extract_solution(trace: &ParsedTrace) -> Option<String> {
+    let last_round = trace.rounds.last()?;
+
+    // Combine all agent drafts from the final round
+    let mut solution = String::new();
+    for agent in &last_round.agents {
+        if !solution.is_empty() {
+            solution.push_str("\n\n---\n\n");
+        }
+        solution.push_str(&format!("Agent {} contribution:\n{}", agent.agent_id, agent.draft));
+    }
+
+    Some(solution)
+}
+
+/// Compute total tokens used across all rounds.
+pub fn compute_total_tokens(trace: &ParsedTrace) -> usize {
+    trace.rounds.iter()
+        .flat_map(|r| r.agents.iter())
+        .map(|a| a.tokens_in + a.tokens_out)
+        .sum()
+}
+
+/// Use LLM-as-judge to evaluate solution quality.
+/// Returns a QualityEval with scores on a 1-10 scale.
+pub fn evaluate_quality(
+    task: &str,
+    solution: &str,
+    tokens_total: usize,
+    llm: &dyn dytopo_llm::LlmClient,
+) -> Result<QualityEval> {
+    let prompt = format!(
+        r#"You are an expert evaluator. Rate the following solution to a task.
+
+TASK: {task}
+
+SOLUTION:
+{solution}
+
+Rate the solution on these criteria (1-10 scale, 10 = excellent):
+1. CORRECTNESS: Does it solve the problem correctly?
+2. COMPLETENESS: Does it cover all aspects of the task?
+3. CLARITY: Is it well-explained and easy to understand?
+
+Respond in this exact JSON format:
+{{
+  "correctness": <1-10>,
+  "completeness": <1-10>,
+  "clarity": <1-10>,
+  "reasoning": "<brief explanation of your ratings>"
+}}
+
+Be strict but fair. A score of 5 is average, 7+ is good, 9+ is excellent."#
+    );
+
+    let response = llm.complete(&prompt)?;
+
+    // Parse the JSON response
+    let json: serde_json::Value = dytopo_llm::extract_json(&response)?;
+
+    let correctness = json["correctness"].as_f64().unwrap_or(5.0) as f32;
+    let completeness = json["completeness"].as_f64().unwrap_or(5.0) as f32;
+    let clarity = json["clarity"].as_f64().unwrap_or(5.0) as f32;
+    let reasoning = json["reasoning"].as_str().unwrap_or("No reasoning provided").to_string();
+
+    // Overall score is average of subscales
+    let score = (correctness + completeness + clarity) / 3.0;
+
+    Ok(QualityEval {
+        task: task.to_string(),
+        solution: solution.to_string(),
+        score,
+        correctness,
+        completeness,
+        clarity,
+        reasoning,
+        tokens_total,
+    })
+}
+
+/// Comparison result between two runs (e.g., dynamic vs baseline).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ComparisonResult {
+    pub name_a: String,
+    pub name_b: String,
+    pub task: String,
+    pub quality_a: QualityEval,
+    pub quality_b: QualityEval,
+    pub metrics_a: TraceMetrics,
+    pub metrics_b: TraceMetrics,
+}
+
+impl ComparisonResult {
+    /// Quality difference (A - B). Positive means A is better.
+    pub fn quality_diff(&self) -> f32 {
+        self.quality_a.score - self.quality_b.score
+    }
+
+    /// Token efficiency: quality per 1000 tokens.
+    pub fn efficiency_a(&self) -> f32 {
+        if self.quality_a.tokens_total == 0 {
+            0.0
+        } else {
+            self.quality_a.score / (self.quality_a.tokens_total as f32 / 1000.0)
+        }
+    }
+
+    pub fn efficiency_b(&self) -> f32 {
+        if self.quality_b.tokens_total == 0 {
+            0.0
+        } else {
+            self.quality_b.score / (self.quality_b.tokens_total as f32 / 1000.0)
+        }
+    }
+
+    /// Generate markdown comparison report.
+    pub fn to_markdown(&self) -> String {
+        let mut s = String::new();
+
+        s.push_str(&format!("# Comparison: {} vs {}\n\n", self.name_a, self.name_b));
+        s.push_str(&format!("**Task:** {}\n\n", self.task));
+
+        s.push_str("## Quality Scores (1-10 scale)\n\n");
+        s.push_str("| Metric | {} | {} | Winner |\n");
+        s.push_str("|--------|");
+        s.push_str(&format!("{}|", self.name_a));
+        s.push_str(&format!("{}|", self.name_b));
+        s.push_str("--------|\n");
+
+        let winner = |a: f32, b: f32| -> &str {
+            if a > b + 0.5 { &self.name_a }
+            else if b > a + 0.5 { &self.name_b }
+            else { "Tie" }
+        };
+
+        s.push_str(&format!(
+            "| Overall | {:.1} | {:.1} | {} |\n",
+            self.quality_a.score, self.quality_b.score,
+            winner(self.quality_a.score, self.quality_b.score)
+        ));
+        s.push_str(&format!(
+            "| Correctness | {:.1} | {:.1} | {} |\n",
+            self.quality_a.correctness, self.quality_b.correctness,
+            winner(self.quality_a.correctness, self.quality_b.correctness)
+        ));
+        s.push_str(&format!(
+            "| Completeness | {:.1} | {:.1} | {} |\n",
+            self.quality_a.completeness, self.quality_b.completeness,
+            winner(self.quality_a.completeness, self.quality_b.completeness)
+        ));
+        s.push_str(&format!(
+            "| Clarity | {:.1} | {:.1} | {} |\n",
+            self.quality_a.clarity, self.quality_b.clarity,
+            winner(self.quality_a.clarity, self.quality_b.clarity)
+        ));
+
+        s.push_str("\n## Efficiency\n\n");
+        s.push_str("| Metric | {} | {} |\n");
+        s.push_str(&format!("|--------|{}|{}|\n", self.name_a, self.name_b));
+        s.push_str(&format!(
+            "| Total Tokens | {} | {} |\n",
+            self.quality_a.tokens_total, self.quality_b.tokens_total
+        ));
+        s.push_str(&format!(
+            "| Total Edges | {} | {} |\n",
+            self.metrics_a.summary.total_edges, self.metrics_b.summary.total_edges
+        ));
+        s.push_str(&format!(
+            "| Quality/1K Tokens | {:.2} | {:.2} |\n",
+            self.efficiency_a(), self.efficiency_b()
+        ));
+
+        s.push_str("\n## Reasoning\n\n");
+        s.push_str(&format!("**{}:** {}\n\n", self.name_a, self.quality_a.reasoning));
+        s.push_str(&format!("**{}:** {}\n\n", self.name_b, self.quality_b.reasoning));
+
+        s
+    }
+}
+
+/// Plot quality comparison as bar chart.
+pub fn plot_quality_comparison(results: &[(&str, f32)], output_path: &str) -> Result<()> {
+    let root = SVGBackend::new(output_path, (800, 400)).into_drawing_area();
+    root.fill(&WHITE)?;
+
+    let max_score = 10.0f32;
+    let n = results.len();
+
+    let mut chart = ChartBuilder::on(&root)
+        .caption("Quality Scores by Topology", ("sans-serif", 24))
+        .margin(20)
+        .x_label_area_size(60)
+        .y_label_area_size(50)
+        .build_cartesian_2d(0..(n as i32), 0f32..max_score)?;
+
+    chart
+        .configure_mesh()
+        .x_desc("Topology")
+        .y_desc("Quality Score (1-10)")
+        .x_labels(n)
+        .x_label_formatter(&|i| {
+            results.get(*i as usize).map(|(name, _)| name.to_string()).unwrap_or_default()
+        })
+        .draw()?;
+
+    // Draw bars with different colors
+    let colors = [BLUE, GREEN, RED, CYAN, MAGENTA];
+    for (i, (_, score)) in results.iter().enumerate() {
+        let color = colors[i % colors.len()];
+        chart.draw_series(std::iter::once(Rectangle::new(
+            [(i as i32, 0f32), (i as i32 + 1, *score)],
+            color.mix(0.8).filled(),
+        )))?;
+    }
+
+    root.present()?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -553,5 +799,11 @@ mod tests {
         // Can't test without a file, but verify struct defaults
         let trace = ParsedTrace::default();
         assert_eq!(trace.rounds.len(), 0);
+    }
+
+    #[test]
+    fn test_extract_solution_empty() {
+        let trace = ParsedTrace::default();
+        assert!(extract_solution(&trace).is_none());
     }
 }

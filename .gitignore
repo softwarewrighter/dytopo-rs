@@ -1,5 +1,6 @@
 /target
 /traces
 /benchmark
+/benchmark_llm
 **/*.dot
 .DS_Store

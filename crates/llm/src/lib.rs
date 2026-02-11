@@ -10,10 +10,29 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+/// Response from an LLM completion with token counts.
+#[derive(Clone, Debug, Default)]
+pub struct LlmResponse {
+    pub text: String,
+    pub tokens_in: usize,
+    pub tokens_out: usize,
+}
+
 /// Trait for LLM completion clients.
 pub trait LlmClient: Send + Sync {
     /// Send a prompt and get a completion response.
     fn complete(&self, prompt: &str) -> Result<String>;
+
+    /// Send a prompt and get a completion with token counts.
+    fn complete_with_tokens(&self, prompt: &str) -> Result<LlmResponse> {
+        // Default implementation for backward compatibility
+        let text = self.complete(prompt)?;
+        Ok(LlmResponse {
+            text,
+            tokens_in: 0,
+            tokens_out: 0,
+        })
+    }
 }
 
 /// Configuration for an Ollama host.
@@ -60,6 +79,10 @@ struct OllamaOptions {
 #[derive(Debug, Deserialize)]
 struct OllamaResp {
     response: String,
+    #[serde(default)]
+    prompt_eval_count: usize,
+    #[serde(default)]
+    eval_count: usize,
 }
 
 impl OllamaClient {
@@ -85,6 +108,10 @@ impl OllamaClient {
 
 impl LlmClient for OllamaClient {
     fn complete(&self, prompt: &str) -> Result<String> {
+        Ok(self.complete_with_tokens(prompt)?.text)
+    }
+
+    fn complete_with_tokens(&self, prompt: &str) -> Result<LlmResponse> {
         let url = format!("{}/api/generate", self.host.base_url);
 
         let req_body = OllamaReq {
@@ -114,7 +141,11 @@ impl LlmClient for OllamaClient {
             .json()
             .context("Failed to parse Ollama response")?;
 
-        Ok(ollama_resp.response)
+        Ok(LlmResponse {
+            text: ollama_resp.response,
+            tokens_in: ollama_resp.prompt_eval_count,
+            tokens_out: ollama_resp.eval_count,
+        })
     }
 }
 
@@ -210,7 +241,7 @@ impl OllamaPool {
     }
 
     /// Send a completion request with load balancing.
-    pub fn complete(&self, prompt: &str) -> Result<String> {
+    pub fn complete_with_tokens(&self, prompt: &str) -> Result<LlmResponse> {
         let (host_idx, wait) = self.select_host();
 
         // Stagger if needed
@@ -263,7 +294,16 @@ impl OllamaPool {
         };
 
         self.release_host(host_idx);
-        Ok(ollama_resp.response)
+        Ok(LlmResponse {
+            text: ollama_resp.response,
+            tokens_in: ollama_resp.prompt_eval_count,
+            tokens_out: ollama_resp.eval_count,
+        })
+    }
+
+    /// Send a completion request (convenience wrapper).
+    pub fn complete(&self, prompt: &str) -> Result<String> {
+        Ok(self.complete_with_tokens(prompt)?.text)
     }
 
     /// Get current load statistics for monitoring.
@@ -281,7 +321,11 @@ impl OllamaPool {
 
 impl LlmClient for OllamaPool {
     fn complete(&self, prompt: &str) -> Result<String> {
-        self.complete(prompt)
+        OllamaPool::complete(self, prompt)
+    }
+
+    fn complete_with_tokens(&self, prompt: &str) -> Result<LlmResponse> {
+        OllamaPool::complete_with_tokens(self, prompt)
     }
 }
 

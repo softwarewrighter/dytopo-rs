@@ -81,6 +81,8 @@ pub fn run_stub(
                 query: io.query.clone(),
                 key: io.key.clone(),
                 draft: io.draft.clone(),
+                tokens_in: 0,  // TODO: get from agent response
+                tokens_out: 0,
             };
             serde_json::to_writer(&mut w, &ev)?;
             w.write_all(b"\n")?;

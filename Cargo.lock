@@ -370,6 +370,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "dytopo-core",
+ "dytopo-llm",
  "plotters",
  "serde",
  "serde_json",
