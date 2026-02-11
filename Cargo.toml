@@ -1,0 +1,18 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/core",
+  "crates/embed",
+  "crates/router",
+  "crates/llm",
+  "crates/agents",
+  "crates/orchestrator",
+  "crates/viz",
+  "crates/cli",
+]
+
+[workspace.package]
+edition = "2021"
+license = "MIT OR Apache-2.0"
+authors = ["You <you@example.com>"]
+repository = "https://example.invalid/dytopo-rs"

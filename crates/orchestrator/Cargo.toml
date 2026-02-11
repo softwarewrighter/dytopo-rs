@@ -1,0 +1,12 @@
+[package]
+name = "dytopo-orchestrator"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+serde_json = "1"
+dytopo-core = { path = "../core" }
+dytopo-embed = { path = "../embed" }
+dytopo-router = { path = "../router" }
+dytopo-agents = { path = "../agents" }

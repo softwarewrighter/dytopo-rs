@@ -1,0 +1,10 @@
+[package]
+name = "dytopo-router"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+rayon = "1"
+dytopo-core = { path = "../core" }
+dytopo-embed = { path = "../embed" }

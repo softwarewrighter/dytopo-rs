@@ -1,0 +1,15 @@
+[package]
+name = "dytopo-cli"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+dytopo-core = { path = "../core" }
+dytopo-embed = { path = "../embed" }
+dytopo-router = { path = "../router" }
+dytopo-llm = { path = "../llm" }
+dytopo-agents = { path = "../agents" }
+dytopo-orchestrator = { path = "../orchestrator" }
+dytopo-viz = { path = "../viz" }

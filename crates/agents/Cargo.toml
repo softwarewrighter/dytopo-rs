@@ -1,0 +1,11 @@
+[package]
+name = "dytopo-agents"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+rand = "0.8"
+serde_json = "1"
+dytopo-core = { path = "../core" }
+dytopo-llm = { path = "../llm" }
