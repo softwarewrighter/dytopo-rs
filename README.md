@@ -29,6 +29,14 @@ Outputs:
 - stdout: per-round topology + messages
 - `./traces/trace_*.jsonl`: machine-readable trace
 
+## Benchmark Results
+
+See **[docs/results.md](docs/results.md)** for benchmark comparisons of dynamic vs fixed topologies.
+
+Key finding: Dynamic routing achieves **comparable quality with 33% fewer edges** than fully-connected, and runs **64% faster**.
+
+Visualizations available in `results/*.svg`.
+
 ## Docs for your coding agent
 
 - **AGENTS.md** — how to iterate safely, in small PR-sized steps
@@ -36,6 +44,7 @@ Outputs:
 - **docs/PROTOCOL.md** — message schemas and invariants
 - **docs/ARCHITECTURE.md** — crate boundaries + design rationale
 - **docs/RUN.md** — how to run demos, tests, and trace export
+- **docs/results.md** — benchmark results and analysis
 
 ## License
 
