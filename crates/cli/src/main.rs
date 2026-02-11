@@ -184,15 +184,15 @@ fn main() -> Result<()> {
                 }
             };
 
-            let mut cfg = OrchestratorConfig::default();
-            cfg.rounds = rounds;
-            cfg.max_inbox = max_inbox;
-
-            let mut r = RouterConfig::default();
-            r.topk_per_receiver = topk;
-            r.min_score = min_score;
-            r.force_connect = force_connect;
-            cfg.router = r;
+            let cfg = OrchestratorConfig {
+                rounds,
+                max_inbox,
+                router: RouterConfig {
+                    topk_per_receiver: topk,
+                    min_score,
+                    force_connect,
+                },
+            };
 
             // Create agents based on LLM provider
             let workers: Vec<Box<dyn Agent>> = match llm {
