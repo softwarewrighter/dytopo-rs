@@ -2,6 +2,8 @@
 
 This repository is a **Rust workspace** that implements a **DyTopo-inspired** dynamic communication topology for multi-agent systems.
 
+Based on the paper: **[DyTopo: Dynamic Topology Routing for Multi-Agent Reasoning](https://arxiv.org/abs/2505.16128)** (Li et al., 2025)
+
 **Goal:** each round, agents emit:
 - **Query** (what I need)
 - **Key** (what I offer)
