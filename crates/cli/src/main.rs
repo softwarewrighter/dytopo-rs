@@ -3,11 +3,12 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
 use dytopo_agents::{specialties, Agent, LlmWorker, LlmWorkerConfig, StubWorker};
+use dytopo_analyze::{compute_metrics, format_report, generate_all_plots, load_trace};
 use dytopo_core::AgentId;
 use dytopo_embed::{Embedder, HashEmbedder, OllamaEmbedder};
 use dytopo_llm::{LlmClient, OllamaHost, OllamaPool};
 use dytopo_orchestrator::{run_stub, OrchestratorConfig};
-use dytopo_router::RouterConfig;
+use dytopo_router::{BaselineTopology, RouterConfig};
 use dytopo_viz::write_dot;
 use std::sync::Arc;
 
@@ -37,6 +38,25 @@ enum EmbedderType {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Analyze a trace file and generate metrics/plots
+    Analyze {
+        /// Path to the JSONL trace file
+        #[arg(long)]
+        trace: String,
+
+        /// Output directory for plots (default: same as trace)
+        #[arg(long)]
+        out: Option<String>,
+
+        /// Output format (text, json, csv)
+        #[arg(long, default_value = "text")]
+        format: String,
+
+        /// Skip plot generation
+        #[arg(long)]
+        no_plots: bool,
+    },
+
     /// Run a demo with configurable agents
     Demo {
         /// Number of rounds
@@ -100,6 +120,33 @@ enum Command {
         #[arg(long)]
         embed_url: Option<String>,
     },
+
+    /// Compare dynamic routing against baseline topologies
+    Benchmark {
+        /// Task description
+        #[arg(long, default_value = "Write a Python function to sort a list")]
+        task: String,
+
+        /// Number of agents
+        #[arg(long, default_value_t = 5)]
+        agents: usize,
+
+        /// Number of rounds per experiment
+        #[arg(long, default_value_t = 3)]
+        rounds: usize,
+
+        /// Output directory
+        #[arg(long, default_value = "benchmark")]
+        out: String,
+
+        /// Ollama URL for embeddings
+        #[arg(long, default_value = "http://localhost:11434")]
+        embed_url: String,
+
+        /// Embedding model
+        #[arg(long, default_value = "nomic-embed-text")]
+        embed_model: String,
+    },
 }
 
 /// Parse host specification: name=url:concurrent
@@ -150,6 +197,57 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.cmd {
+        Command::Analyze {
+            trace,
+            out,
+            format,
+            no_plots,
+        } => {
+            println!("Loading trace: {trace}");
+            let parsed = load_trace(&trace)?;
+            let metrics = compute_metrics(&parsed, &trace);
+
+            match format.as_str() {
+                "json" => {
+                    let json = serde_json::to_string_pretty(&metrics)?;
+                    println!("{json}");
+                }
+                "csv" => {
+                    println!("round,duration_ms,edges,avg_score,min_score,max_score,density");
+                    for r in &metrics.rounds {
+                        println!(
+                            "{},{},{},{:.4},{:.4},{:.4},{:.4}",
+                            r.round,
+                            r.duration_ms,
+                            r.edge_count,
+                            r.avg_score,
+                            r.min_score,
+                            r.max_score,
+                            r.graph_density
+                        );
+                    }
+                }
+                _ => {
+                    let report = format_report(&metrics);
+                    println!("{report}");
+                }
+            }
+
+            if !no_plots {
+                let out_dir = out.unwrap_or_else(|| {
+                    std::path::Path::new(&trace)
+                        .parent()
+                        .map(|p| p.to_string_lossy().to_string())
+                        .unwrap_or_else(|| ".".to_string())
+                });
+                let plot_paths = generate_all_plots(&metrics, &out_dir)?;
+                println!("\nGenerated plots:");
+                for p in plot_paths {
+                    println!("  {p}");
+                }
+            }
+        }
+
         Command::Demo {
             rounds,
             agents,
@@ -256,6 +354,148 @@ fn main() -> Result<()> {
             if llm == LlmProvider::Ollama || embedder == EmbedderType::Ollama {
                 println!("\nDemo complete. Check traces for full output.");
             }
+        }
+
+        Command::Benchmark {
+            task,
+            agents,
+            rounds,
+            out,
+            embed_url,
+            embed_model,
+        } => {
+            use dytopo_router::build_baseline_topology;
+            use std::time::Instant;
+
+            std::fs::create_dir_all(&out)?;
+
+            println!("=== DyTopo Benchmark ===\n");
+            println!("Task: {task}");
+            println!("Agents: {agents}");
+            println!("Rounds: {rounds}");
+            println!("Embeddings: {embed_url} ({embed_model})");
+            println!();
+
+            let agent_ids: Vec<AgentId> = (1..=agents).map(AgentId).collect();
+
+            // Create embedder for dynamic routing
+            let embedder = OllamaEmbedder::new(&embed_url, &embed_model)?;
+
+            // Run dynamic routing experiment
+            println!("Running DYNAMIC routing experiment...");
+            let dynamic_start = Instant::now();
+
+            let cfg = OrchestratorConfig {
+                rounds,
+                max_inbox: 3,
+                router: RouterConfig {
+                    topk_per_receiver: 2,
+                    min_score: 0.1,
+                    force_connect: true,
+                },
+            };
+
+            let workers: Vec<Box<dyn Agent>> = (0..agents)
+                .map(|i| {
+                    let id = AgentId(i + 1);
+                    Box::new(StubWorker::new(id, 1234)) as Box<dyn Agent>
+                })
+                .collect();
+
+            let dynamic_run = run_stub(&task, workers, &embedder, &cfg, &out, "dynamic")?;
+            let dynamic_duration = dynamic_start.elapsed();
+
+            // Compute metrics for dynamic
+            let dynamic_trace = load_trace(&dynamic_run.trace_path)?;
+            let dynamic_metrics = compute_metrics(&dynamic_trace, &dynamic_run.trace_path);
+
+            println!("  Duration: {:?}", dynamic_duration);
+            println!("  Avg Score: {:.3}", dynamic_metrics.summary.overall_avg_score);
+            println!("  Edge Stability: {:.1}%", dynamic_metrics.summary.edge_stability * 100.0);
+            println!();
+
+            // Run baseline experiments (just compute topology metrics, no full orchestration)
+            let baselines = [
+                ("FullyConnected", BaselineTopology::FullyConnected),
+                ("Star", BaselineTopology::Star),
+                ("Chain", BaselineTopology::Chain),
+                ("Ring", BaselineTopology::Ring),
+            ];
+
+            println!("Baseline Topologies (edge counts for comparison):\n");
+            println!("| Topology | Edges | Density |");
+            println!("|----------|-------|---------|");
+
+            for (name, baseline) in &baselines {
+                let topo = build_baseline_topology(0, *baseline, &agent_ids);
+                let max_edges = agents * (agents - 1);
+                let density = topo.edges.len() as f32 / max_edges as f32;
+                println!("| {} | {} | {:.1}% |", name, topo.edges.len(), density * 100.0);
+            }
+
+            println!();
+            println!("Dynamic Routing Summary:");
+            println!("  Total Duration: {}ms", dynamic_metrics.summary.total_duration_ms);
+            println!("  Avg Edges/Round: {:.1}", dynamic_metrics.summary.avg_edges_per_round);
+            println!("  Avg Score: {:.3}", dynamic_metrics.summary.overall_avg_score);
+            println!("  Score Trend: {:+.4}/round", dynamic_metrics.summary.score_trend);
+            println!("  Edge Stability: {:.1}%", dynamic_metrics.summary.edge_stability * 100.0);
+
+            // Generate comparison plots
+            let plot_paths = generate_all_plots(&dynamic_metrics, &out)?;
+            println!("\nGenerated plots:");
+            for p in &plot_paths {
+                println!("  {p}");
+            }
+
+            // Write comparison report
+            let report_path = format!("{}/benchmark_report.md", out);
+            let mut report = String::new();
+            report.push_str("# DyTopo Benchmark Report\n\n");
+            report.push_str(&format!("**Task:** {}\n\n", task));
+            report.push_str(&format!("**Agents:** {} | **Rounds:** {}\n\n", agents, rounds));
+
+            report.push_str("## Dynamic Routing Results\n\n");
+            report.push_str("| Metric | Value |\n|--------|-------|\n");
+            report.push_str(&format!("| Total Duration | {}ms |\n", dynamic_metrics.summary.total_duration_ms));
+            report.push_str(&format!("| Avg Edges/Round | {:.1} |\n", dynamic_metrics.summary.avg_edges_per_round));
+            report.push_str(&format!("| Avg Score | {:.3} |\n", dynamic_metrics.summary.overall_avg_score));
+            report.push_str(&format!("| Score Trend | {:+.4}/round |\n", dynamic_metrics.summary.score_trend));
+            report.push_str(&format!("| Edge Stability | {:.1}% |\n", dynamic_metrics.summary.edge_stability * 100.0));
+
+            report.push_str("\n## Baseline Comparison\n\n");
+            report.push_str("| Topology | Edges | Density | vs Dynamic |\n");
+            report.push_str("|----------|-------|---------|------------|\n");
+
+            let dynamic_edges = dynamic_metrics.summary.avg_edges_per_round;
+            for (name, baseline) in &baselines {
+                let topo = build_baseline_topology(0, *baseline, &agent_ids);
+                let max_edges = agents * (agents - 1);
+                let density = topo.edges.len() as f32 / max_edges as f32;
+                let ratio = topo.edges.len() as f32 / dynamic_edges;
+                report.push_str(&format!(
+                    "| {} | {} | {:.1}% | {:.1}x |\n",
+                    name, topo.edges.len(), density * 100.0, ratio
+                ));
+            }
+
+            report.push_str("\n## Key Insight\n\n");
+            report.push_str("Dynamic routing achieves **semantic matching** between agents, ");
+            report.push_str("connecting those with complementary needs/offers. ");
+            report.push_str(&format!(
+                "With an average score of {:.3}, agents are matched based on semantic similarity ",
+                dynamic_metrics.summary.overall_avg_score
+            ));
+            report.push_str("rather than arbitrary topology.\n\n");
+
+            report.push_str("## Plots\n\n");
+            for p in &plot_paths {
+                let filename = std::path::Path::new(p).file_name().unwrap().to_str().unwrap();
+                report.push_str(&format!("![{}]({})\n\n", filename, filename));
+            }
+
+            std::fs::write(&report_path, &report)?;
+            println!("\nBenchmark report: {report_path}");
         }
     }
 

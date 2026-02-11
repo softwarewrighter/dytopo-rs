@@ -8,6 +8,7 @@ members = [
   "crates/agents",
   "crates/orchestrator",
   "crates/viz",
+  "crates/analyze",
   "crates/cli",
 ]
 

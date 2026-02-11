@@ -43,7 +43,7 @@ pub enum TraceEvent {
         round: usize,
         goal: String,
         agent_count: usize,
-        ts_unix_ms: u128,
+        ts_unix_ms: u64,
     },
     AgentIO {
         round: usize,
@@ -65,6 +65,6 @@ pub enum TraceEvent {
     },
     RoundEnd {
         round: usize,
-        ts_unix_ms: u128,
+        ts_unix_ms: u64,
     },
 }

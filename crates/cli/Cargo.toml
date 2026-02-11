@@ -13,3 +13,5 @@ dytopo-llm = { path = "../llm" }
 dytopo-agents = { path = "../agents" }
 dytopo-orchestrator = { path = "../orchestrator" }
 dytopo-viz = { path = "../viz" }
+dytopo-analyze = { path = "../analyze" }
+serde_json = "1"

@@ -84,3 +84,126 @@ pub fn build_topology(
 
     Ok(Topology { round, edges })
 }
+
+/// Baseline topology types for comparison experiments.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum BaselineTopology {
+    /// Every agent connected to every other agent
+    FullyConnected,
+    /// One central agent (first agent) connected to all others
+    Star,
+    /// Sequential chain: 1->2->3->...->N
+    Chain,
+    /// Circular: 1->2->3->...->N->1
+    Ring,
+}
+
+/// Build a baseline topology for comparison with dynamic routing.
+pub fn build_baseline_topology(
+    round: usize,
+    baseline: BaselineTopology,
+    agent_ids: &[AgentId],
+) -> Topology {
+    let edges = match baseline {
+        BaselineTopology::FullyConnected => {
+            let mut e = Vec::new();
+            for &from in agent_ids {
+                for &to in agent_ids {
+                    if from != to {
+                        e.push(Edge {
+                            from,
+                            to,
+                            score: 1.0, // uniform score for baselines
+                        });
+                    }
+                }
+            }
+            e
+        }
+        BaselineTopology::Star => {
+            // First agent is the hub
+            let mut e = Vec::new();
+            if let Some(&hub) = agent_ids.first() {
+                for &other in agent_ids.iter().skip(1) {
+                    // Hub -> other
+                    e.push(Edge {
+                        from: hub,
+                        to: other,
+                        score: 1.0,
+                    });
+                    // Other -> hub
+                    e.push(Edge {
+                        from: other,
+                        to: hub,
+                        score: 1.0,
+                    });
+                }
+            }
+            e
+        }
+        BaselineTopology::Chain => {
+            let mut e = Vec::new();
+            for i in 0..agent_ids.len().saturating_sub(1) {
+                e.push(Edge {
+                    from: agent_ids[i],
+                    to: agent_ids[i + 1],
+                    score: 1.0,
+                });
+            }
+            e
+        }
+        BaselineTopology::Ring => {
+            let mut e = Vec::new();
+            let n = agent_ids.len();
+            if n > 0 {
+                for i in 0..n {
+                    e.push(Edge {
+                        from: agent_ids[i],
+                        to: agent_ids[(i + 1) % n],
+                        score: 1.0,
+                    });
+                }
+            }
+            e
+        }
+    };
+
+    Topology { round, edges }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_baseline_fully_connected() {
+        let ids = vec![AgentId(1), AgentId(2), AgentId(3)];
+        let topo = build_baseline_topology(0, BaselineTopology::FullyConnected, &ids);
+        // 3 agents = 3*(3-1) = 6 edges
+        assert_eq!(topo.edges.len(), 6);
+    }
+
+    #[test]
+    fn test_baseline_star() {
+        let ids = vec![AgentId(1), AgentId(2), AgentId(3)];
+        let topo = build_baseline_topology(0, BaselineTopology::Star, &ids);
+        // Hub connects to 2 others bidirectionally = 4 edges
+        assert_eq!(topo.edges.len(), 4);
+    }
+
+    #[test]
+    fn test_baseline_chain() {
+        let ids = vec![AgentId(1), AgentId(2), AgentId(3)];
+        let topo = build_baseline_topology(0, BaselineTopology::Chain, &ids);
+        // 1->2, 2->3 = 2 edges
+        assert_eq!(topo.edges.len(), 2);
+    }
+
+    #[test]
+    fn test_baseline_ring() {
+        let ids = vec![AgentId(1), AgentId(2), AgentId(3)];
+        let topo = build_baseline_topology(0, BaselineTopology::Ring, &ids);
+        // 1->2, 2->3, 3->1 = 3 edges
+        assert_eq!(topo.edges.len(), 3);
+    }
+}

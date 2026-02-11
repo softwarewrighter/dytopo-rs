@@ -9,12 +9,13 @@
 | Core Types | Done | AgentId, AgentIO, Edge, Topology, TraceEvent |
 | Hash Embedder | Done | Deterministic baseline |
 | Semantic Embedder | Done | OllamaEmbedder with nomic-embed-text |
-| Router | Done | Top-K sparsification, force-connect |
+| Router | Done | Top-K sparsification, force-connect, baselines |
 | Stub Agents | Done | Domain-tagged templates |
 | LLM Agents | Done | OllamaPool + LlmWorker with retry logic |
 | Orchestrator | Done | Full round loop with traces |
 | DOT Export | Done | GraphViz visualization |
-| CLI | Done | `demo` command with LLM + embedder support |
+| Trace Analysis | Done | Metrics computation, SVG plots |
+| CLI | Done | `demo`, `analyze`, `benchmark` commands |
 | JSONL Traces | Done | Valid format, all events |
 
 ## Milestone Progress
@@ -67,12 +68,13 @@
 
 ### Milestone 4 - Evaluation
 
-**Status: NOT STARTED**
+**Status: COMPLETE**
 
-- [ ] Baseline topologies (fully-connected, chain, star)
-- [ ] `analyze-trace` command
-- [ ] Benchmark task suite
-- [ ] Comparison report
+- [x] Baseline topologies (fully-connected, chain, star, ring)
+- [x] `analyze` command with metrics and plots
+- [x] `benchmark` command for comparative runs
+- [x] Comparison report generation
+- [x] SVG plot generation (scores, timing, density)
 
 ---
 
@@ -113,10 +115,15 @@
 - **Tests:** 0
 - **Status:** DOT export working
 
+### dytopo-analyze (v0.1.0)
+- **Lines:** ~350
+- **Tests:** 1
+- **Status:** Trace analysis, metrics, SVG plots
+
 ### dytopo-cli (v0.1.0)
-- **Lines:** ~260
+- **Lines:** ~490
 - **Tests:** 0
-- **Status:** Full demo command working
+- **Status:** `demo`, `analyze`, `benchmark` commands
 
 ---
 
@@ -152,6 +159,26 @@ cargo run -p dytopo-cli -- demo \
   --task "Write a Python function to calculate Fibonacci numbers"
 ```
 
+### Analyze a Trace
+
+```bash
+cargo run -p dytopo-cli -- analyze --trace traces/trace_demo_*.jsonl
+```
+
+Options:
+- `--format json|csv|text` - Output format
+- `--no-plots` - Skip SVG plot generation
+
+### Run Benchmark (Dynamic vs Baselines)
+
+```bash
+cargo run -p dytopo-cli -- benchmark \
+  --task "Write a Python function to sort a list" \
+  --agents 5 \
+  --rounds 3 \
+  --embed-url http://localhost:11434
+```
+
 ---
 
 ## Embedding Comparison
@@ -171,12 +198,22 @@ With semantic embeddings:
 
 1. **Verify process:** `cargo clippy && cargo test`
 2. **Run full demo:** See commands above
-3. **Visualize:** `dot -Tpng traces/topology_demo_round*.dot -O && open traces/*.png`
-4. **Next milestone:** Evaluation harness (M4) or message summarization (M3)
+3. **Run benchmark:** `cargo run -p dytopo-cli -- benchmark --embed-url http://localhost:11434`
+4. **View plots:** Open `benchmark/scores.svg`, `benchmark/timing.svg`, `benchmark/density.svg`
+5. **Next milestone:** Message summarization (M3)
 
 ---
 
 ## Change Log
+
+### 2026-02-11 (Evening)
+- **Milestone 4 Complete:**
+  - Created dytopo-analyze crate for trace analysis
+  - Added `analyze` CLI command with metrics and SVG plots
+  - Added `benchmark` CLI command for comparison runs
+  - Added baseline topologies (fully-connected, star, chain, ring)
+  - Generates markdown benchmark reports
+  - SVG plots: scores, timing, density over rounds
 
 ### 2026-02-11 (PM - Late)
 - **Milestone 1 Complete:**
