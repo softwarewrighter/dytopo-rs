@@ -27,9 +27,9 @@ fn cosine(a: &Embedding, b: &Embedding) -> f32 {
 }
 
 /// Build a sparse directed topology from agent keys -> agent queries.
-pub fn build_topology<E: Embedder>(
+pub fn build_topology(
     round: usize,
-    embedder: &E,
+    embedder: &dyn Embedder,
     keys: &[(AgentId, String)],
     queries: &[(AgentId, String)],
     cfg: &RouterConfig,

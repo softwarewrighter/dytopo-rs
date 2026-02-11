@@ -4,7 +4,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
 use dytopo_agents::{specialties, Agent, LlmWorker, LlmWorkerConfig, StubWorker};
 use dytopo_core::AgentId;
-use dytopo_embed::HashEmbedder;
+use dytopo_embed::{Embedder, HashEmbedder, OllamaEmbedder};
 use dytopo_llm::{LlmClient, OllamaHost, OllamaPool};
 use dytopo_orchestrator::{run_stub, OrchestratorConfig};
 use dytopo_router::RouterConfig;
@@ -24,6 +24,14 @@ enum LlmProvider {
     /// No LLM - use stub agents
     None,
     /// Use Ollama for LLM inference
+    Ollama,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum, PartialEq)]
+enum EmbedderType {
+    /// Hash-based embeddings (deterministic, not semantic)
+    Hash,
+    /// Ollama embeddings (semantic, using nomic-embed-text or similar)
     Ollama,
 }
 
@@ -67,18 +75,30 @@ enum Command {
         #[arg(long, value_enum, default_value_t = LlmProvider::None)]
         llm: LlmProvider,
 
-        /// Model name for LLM (e.g., llama2, mistral, codellama)
+        /// Model name for LLM (e.g., llama2, mistral, qwen2.5:7b-instruct)
         #[arg(long, default_value = "llama2")]
         model: String,
 
-        /// Ollama host URLs (comma-separated, format: name=url:concurrent)
+        /// Ollama host URLs for LLM (comma-separated, format: name=url:concurrent)
         /// Example: manager=http://manager:11434:2,curiosity=http://curiosity:11434:3
         #[arg(long, default_value = "manager=http://manager.local:11434:2,curiosity=http://curiosity.local:11434:3")]
         ollama_hosts: String,
 
-        /// Stagger delay in milliseconds between requests to same host
+        /// Stagger delay in milliseconds between LLM requests to same host
         #[arg(long, default_value_t = 500)]
         stagger_ms: u64,
+
+        /// Embedder type for routing (hash = deterministic, ollama = semantic)
+        #[arg(long, value_enum, default_value_t = EmbedderType::Hash)]
+        embedder: EmbedderType,
+
+        /// Embedding model name (for ollama embedder)
+        #[arg(long, default_value = "nomic-embed-text")]
+        embed_model: String,
+
+        /// Ollama URL for embeddings (defaults to first LLM host)
+        #[arg(long)]
+        embed_url: Option<String>,
     },
 }
 
@@ -99,16 +119,18 @@ fn parse_host(spec: &str) -> Result<OllamaHost> {
     let concurrent: usize = url_concurrent[0].parse()?;
     let url = url_concurrent[1];
 
-    // Handle case where URL has port (http://host:11434:2)
-    // rsplitn splits from the right, so url_concurrent[1] is everything before last :
-    // and url_concurrent[0] is the concurrent count
-
     Ok(OllamaHost::new(name, url, concurrent))
 }
 
 /// Parse comma-separated host specifications.
 fn parse_hosts(specs: &str) -> Result<Vec<OllamaHost>> {
     specs.split(',').map(|s| parse_host(s.trim())).collect()
+}
+
+/// Extract base URL from first host spec (for embeddings).
+fn extract_first_url(specs: &str) -> Result<String> {
+    let host = parse_host(specs.split(',').next().unwrap_or(specs).trim())?;
+    Ok(host.base_url)
 }
 
 /// Get specialty for agent based on index (rotating through available specialties).
@@ -141,8 +163,26 @@ fn main() -> Result<()> {
             model,
             ollama_hosts,
             stagger_ms,
+            embedder,
+            embed_model,
+            embed_url,
         } => {
-            let embedder = HashEmbedder::new(128, 42);
+            // Create embedder based on type
+            let embedder_impl: Box<dyn Embedder> = match embedder {
+                EmbedderType::Hash => {
+                    println!("Using hash embeddings (deterministic, not semantic)");
+                    Box::new(HashEmbedder::new(128, 42))
+                }
+                EmbedderType::Ollama => {
+                    let url = embed_url
+                        .clone()
+                        .unwrap_or_else(|| extract_first_url(&ollama_hosts).unwrap_or_else(|_| "http://localhost:11434".to_string()));
+                    println!("Using Ollama semantic embeddings:");
+                    println!("  URL: {url}");
+                    println!("  Model: {embed_model}");
+                    Box::new(OllamaEmbedder::new(&url, &embed_model)?)
+                }
+            };
 
             let mut cfg = OrchestratorConfig::default();
             cfg.rounds = rounds;
@@ -195,11 +235,11 @@ fn main() -> Result<()> {
                 }
             };
 
-            println!("Starting demo with {} agents, {} rounds", agents, rounds);
+            println!("\nStarting demo with {} agents, {} rounds", agents, rounds);
             println!("Task: {task}");
             println!();
 
-            let run = run_stub(&task, workers, &embedder, &cfg, &out, "demo")?;
+            let run = run_stub(&task, workers, embedder_impl.as_ref(), &cfg, &out, "demo")?;
             println!("\nTrace written to: {}", run.trace_path);
 
             for topo in &run.topologies {
@@ -212,8 +252,8 @@ fn main() -> Result<()> {
                 }
             }
 
-            // Print load stats if using Ollama
-            if llm == LlmProvider::Ollama {
+            // Print summary
+            if llm == LlmProvider::Ollama || embedder == EmbedderType::Ollama {
                 println!("\nDemo complete. Check traces for full output.");
             }
         }

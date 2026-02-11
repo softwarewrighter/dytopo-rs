@@ -36,10 +36,10 @@ fn now_ms() -> u128 {
         .as_millis()
 }
 
-pub fn run_stub<E: Embedder>(
+pub fn run_stub(
     task: &str,
     mut agents: Vec<Box<dyn Agent>>,
-    embedder: &E,
+    embedder: &dyn Embedder,
     cfg: &OrchestratorConfig,
     trace_dir: &str,
     run_tag: &str,
