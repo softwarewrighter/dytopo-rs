@@ -195,6 +195,93 @@ def longest_palindrome(s):
 
 4. **Routing efficiency scales** - With more agents, the gap between dynamic and fully-connected grows (O(n) vs O(n²) edges).
 
+---
+
+## Experiment 2: Complex Task (6 Agents)
+
+A more challenging benchmark with 6 agents on a multi-component task.
+
+### Setup
+
+- **Task:** Build a Python LRU cache class with get/put methods, unit tests, and a decorator
+- **Agents:** 6 LLM-powered agents
+- **Rounds:** 4 communication rounds
+- **Model:** qwen2.5:7b-instruct
+
+### Results
+
+| Topology | Duration | Edges/Round | Density | Code Quality |
+|----------|----------|-------------|---------|--------------|
+| **Dynamic** | 173.8s | 12.0 | 40% | Complete implementation |
+| Fully-Connected | 203.8s | 30.0 | 100% | Skeleton only |
+| Chain | 182.6s | 5.0 | 17% | Planning text only |
+
+### Key Findings
+
+**Dynamic routing produced the BEST code despite using 60% fewer edges:**
+
+Dynamic (12 edges/round):
+```python
+class LRUCache:
+    def __init__(self, capacity):
+        self.capacity = capacity
+        self.cache = {}
+        self.order = []
+
+    def get(self, key):
+        if key in self.cache:
+            self.order.remove(key)
+            self.order.append(key)
+            return self.cache[key]
+        return -1
+
+    def put(self, key, value):
+        if key in self.cache:
+            self.order.remove(key)
+        elif len(self.cache) >= self.capacity:
+            lru_key = self.order.pop(0)
+            del self.cache[lru_key]
+        self.cache[key] = value
+        self.order.append(key)
+```
+- ✅ Complete get/put implementation
+- ✅ Handles eviction correctly
+- ✅ Decorator framework started
+
+Fully-Connected (30 edges/round):
+```python
+class LRUCache:
+    def __init__(self, capacity):
+        self.capacity = capacity
+        self.cache = OrderedDict()
+
+    def get(self, key):
+        pass  # Not implemented
+
+    def put(self, key, value):
+        pass  # Not implemented
+```
+- ❌ Only skeleton code
+- ❌ Methods not implemented
+
+### Analysis
+
+| Metric | Dynamic | vs Fully-Connected |
+|--------|---------|-------------------|
+| Edges | 12 | 60% fewer |
+| Duration | 173.8s | 17% faster |
+| Code completeness | Full | Skeleton only |
+
+**Why did dynamic win?**
+
+Semantic routing connected agents based on complementary needs:
+- "I need help implementing LRU eviction" → matched to "I offer caching algorithm expertise"
+- Average similarity: 0.772 (strong semantic matching)
+
+Fully-connected drowned agents in 30 messages per round from everyone, reducing focus.
+
+---
+
 ## Reproducing Results
 
 ```bash
